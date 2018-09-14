@@ -19,6 +19,11 @@ LOG.write('*** RUN ***** %s *****************************************\n' % utils
 def log(logfh, msg, lvl='INFO'):
     logfh.write("%s [%s]  %s\n" % (utils.now(), lvl, msg))
 
+def unshift(arr, val):
+    r = [val]
+    r.extend(arr)
+    return r
+
 def run_child(cmts, uname, passw):
     pid = os.getpid()
     basedir = BASEDIR
@@ -152,9 +157,9 @@ def run_child(cmts, uname, passw):
                     if ip6 != ips[-1]: # current vs last
                         # keep IP pool size
                         if len(ips) == CMTSCACHEIPPOOL:
-                            ips = ips[1:]
+                            ips = ips[:-1]
 
-                        ips.append(ip6)
+                        ips = unshift(ips, ip6)
                 else:
                     ips.append(ip6)
 
