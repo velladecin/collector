@@ -86,9 +86,10 @@ def run_child(cmts, uname, passw):
         # but currently it seems to be the best option. (do I hear.. doh?)
 
         for line in result.split('\r\n'):
-            # 5/7/0-3/7/10      48     8x4   Operational 3.0    12M/1240     0  bcca.b5ff.69b5  fde5:c758:f711:2f:fc63:55cf:fa7d:9992
-            # 10/2/8-2/1/12     19     16x4  Operational 3.1    25M/5215     0  7823.aea8.376d  fde5:c758:f711:6512:7d0c:5025:efaf:494f
-            # 10/2/8-2/1/12     19           Offline     3.1                 0  7823.aea8.37b9
+            # 1) 5/7/0-3/7/10      48     8x4   Operational 3.0    12M/1240     0  bcca.b5ff.69b5  fde5:c758:f711:2f:fc63:55cf:fa7d:9992
+            # 2) 10/2/8-2/1/12     19     16x4  Operational 3.1    25M/5215     0  7823.aea8.376d  fde5:c758:f711:6512:7d0c:5025:efaf:494f
+            # 3) 11/2/14-1/7/12    11     16x4  Online-d    3.1                 0  203d.66ae.f34d  fd29:b4b0:cf0c:c10a:9142:e3c:3170:3f62
+            # 4) 10/2/8-2/1/12     19           Offline     3.1                 0  7823.aea8.37b9
             if not re.match('\d+/\d+/\d+\-\d+/\d+/\d+', line):
                 continue
 
@@ -100,9 +101,9 @@ def run_child(cmts, uname, passw):
                 continue
 
             # STATUS
-            src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+[0-9]+x[0-9]\s+([a-zA-Z]+)\s+[0-9]\.[0-9]', line)  # line 1, 2 above
+            src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+[0-9]+x[0-9]\s+([a-zA-Z\-]+)\s+[0-9]\.[0-9]', line)    # line 1, 2, 3  (Operational, Online-d)
             if not src:
-                src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+([a-zA-Z]+)\s+[0-9]\.[0-9]', line)             # line 3 above
+                src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+([a-zA-Z]+)\s+[0-9]\.[0-9]', line)                 # line 4        (Offline)
 
             try:
                 status = src.group(1)
@@ -154,7 +155,7 @@ def run_child(cmts, uname, passw):
                 ip6 = ip6.rstrip() # strip \r\n
 
                 if ips:
-                    if ip6 != ips[-1]: # current vs last
+                    if ip6 != ips[0]: # current vs last
                         # keep IP pool size
                         if len(ips) == CMTSCACHEIPPOOL:
                             ips = ips[:-1]
