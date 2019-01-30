@@ -1,28 +1,31 @@
 #!/usr/bin/python
-import os, sys, re
-import pexpect
+import os, os.path
+import sys, re
+import getopt, pexpect
 import pickle, json
 import time, signal
 from pprint import pprint
+from datetime import datetime
 # T3
-from t3_PyLib import utils
-
-CMTS_BATCH_SIZE = 20
+import t3_PyLib.Logger
+from t3_PyLib import Utils
+from t3_PyLib.Topology import Topology
+from t3_PyLib.Ssh import Ssh
 
 CMTSCACHEDIR  = 'cmtscache'
 CMTSCACHEIPPOOL = 10
 CMTSLOGDIR = 'cmtslogs'
 BASEDIR = os.path.dirname(sys.argv[0])
-LOG = open('%s.log' % sys.argv[0], 'a', 0)
-LOG.write('*** RUN ***** %s *****************************************\n' % utils.now())
 
-def log(logfh, msg, lvl='INFO'):
-    logfh.write("%s [%s]  %s\n" % (utils.now(), lvl, msg))
+Log = t3_PyLib.Logger.Log('%s.log' % sys.argv[0])
+Log.info('********** Starting Collection Run ***********')
 
 def unshift(arr, val):
-    r = [val]
-    r.extend(arr)
-    return r
+    if not type(val) is list:
+        val = [val]
+
+    val.extend(arr)
+    return val
 
 def run_child(cmts, uname, passw):
     pid = os.getpid()
@@ -30,8 +33,8 @@ def run_child(cmts, uname, passw):
     if not basedir: basedir = '.'
 
     # log your own shit.. :)
-    cmtslog = open('%s/%s/%s.log' % (basedir, CMTSLOGDIR, cmts), 'a', 0)
-    log(cmtslog, "Fork() CMTS %s, PID %d" % (cmts, pid))
+    Cmtslog = t3_PyLib.Logger.Log('%s/%s/%s.log' % (basedir, CMTSLOGDIR, cmts))
+    Cmtslog.info("Fork() CMTS %s, PID %d" % (cmts, pid))
 
     cmtscachefile = "%s/%s/%s" % (basedir, CMTSCACHEDIR, cmts)
     cmtscachefilejson = "%s.json" % cmtscachefile
@@ -48,243 +51,289 @@ def run_child(cmts, uname, passw):
 
     # load existing cache from disk
     if os.path.isfile(cmtscachefile):
-        log(cmtslog, "Reading previous collection from file: %s" % cmtscachefile)
+        Cmtslog.info("Reading previous collection from file: %s" % cmtscachefile)
         with open(cmtscachefile, "rb") as fh:
             pickledict = pickle.loads(fh.read())
 
-    cmtsprompt = '%s#' % cmts
-    passprompt = 'password:'
+    ssh = Ssh()
+    if not ssh.loginCmts_NoHostCheck(cmts, uname, passw):
+        Cmtslog.crit("Could not log in to CMTS %s" % cmts)
+        sys.exit(1)
 
-    now = int(utils.now('%s'))
-    try:
-        child = pexpect.spawn('ssh {0}@{1}'.format(uname, cmts), timeout=90)
-        res = child.expect( [pexpect.TIMEOUT, 'Are you sure you want to continue connecting', passprompt] );
+    ##
+    ## 1. collect CM details
 
-        if res == 0:
-            raise Exception("Timeout connecting to CMTS")
+    # After long testing it seems that the best option is to simply collect what's currently on the CMTS.
+    # Discard anything that has disappeared. This will lose some historical data for eg ppl who are on holidays,
+    # but currently it seems to be the best option. (do I hear.. doh?)
 
-        if res == 1: # new CMTS (SSH key)
-            child.sendline('yes')
-            res = child.expect( [pexpect.TIMEOUT, passprompt] )
-            if res == 0:
-                raise Exception("Timeout accepting new SSH key")
+    for line in ssh.cmdCmts('show cable modem', 120):
+        # 1) 5/7/0-3/7/10      48     8x4   Operational 3.0    12M/1240     0  bcca.b5ff.69b5  fde5:c758:f711:2f:fc63:55cf:fa7d:9992
+        # 2) 10/2/8-2/1/12     19     16x4  Operational 3.1    25M/5215     0  7823.aea8.376d  fde5:c758:f711:6512:7d0c:5025:efaf:494f
+        # 3) 11/2/14-1/7/12    11     16x4  Online-d    3.1                 0  203d.66ae.f34d  fd29:b4b0:cf0c:c10a:9142:e3c:3170:3f62
+        # 4) 10/2/8-2/1/12     19           Offline     3.1                 0  7823.aea8.37b9
+        if not re.match('\d+/\d+/\d+\-\d+/\d+/\d+', line):
+            continue
 
-        child.sendline(passw)
-        child.expect(cmtsprompt)
+        # this will (should) yield single output
+        reip6 = re.findall('[a-f0-9]+\:[a-f0-9\:]+', line)
+        remac = re.findall('[a-f0-9]{4}\.[a-f0-9]{4}\.[a-f0-9]{4}', line)
+        if not remac:
+            Cmtslog.warn("Could not retrieve MAC from: %s" % line)
+            continue
 
-        child.sendline("show cable modem")
-        child.expect(cmtsprompt)
+        # STATUS
+        src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+[0-9]+x[0-9]\s+([a-zA-Z\-]+)\s+[0-9]\.[0-9]', line)    # line 1, 2, 3  (Operational, Online-d)
+        if not src:
+            src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+([a-zA-Z]+)\s+[0-9]\.[0-9]', line)                 # line 4        (Offline)
 
-        result = child.before
-        #pprint(result)
+        try:
+            status = src.group(1)
+        except AttributeError:
+            status = "unknown"
 
-        ##
-        ## 1. collect CM details
+        # FNODE
+        n = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+([0-9]+)\s+', line)
 
-        # After long testing it seems that the best option is to simply collect what's currently on the CMTS.
-        # Discard anything that has disappeared. This will lose some historical data for eg ppl who are on holidays,
-        # but currently it seems to be the best option. (do I hear.. doh?)
+        try:
+            node = n.group(1)
+        except AttributeError:
+            node = "unknown" # should not happen
 
-        for line in result.split('\r\n'):
-            # 1) 5/7/0-3/7/10      48     8x4   Operational 3.0    12M/1240     0  bcca.b5ff.69b5  fde5:c758:f711:2f:fc63:55cf:fa7d:9992
-            # 2) 10/2/8-2/1/12     19     16x4  Operational 3.1    25M/5215     0  7823.aea8.376d  fde5:c758:f711:6512:7d0c:5025:efaf:494f
-            # 3) 11/2/14-1/7/12    11     16x4  Online-d    3.1                 0  203d.66ae.f34d  fd29:b4b0:cf0c:c10a:9142:e3c:3170:3f62
-            # 4) 10/2/8-2/1/12     19           Offline     3.1                 0  7823.aea8.37b9
-            if not re.match('\d+/\d+/\d+\-\d+/\d+/\d+', line):
-                continue
+        # CHANNELS, PROFILE
+        rechn = re.findall('[0-9]+x[0-9]+', line)
+        reprf = re.findall('[0-9]+[K,M]/[0-9]+[K,M]?', line)
 
-            # this will (should) yield single output
-            reip6 = re.findall('[a-f0-9]+\:[a-f0-9\:]+', line)
-            remac = re.findall('[a-f0-9]{4}\.[a-f0-9]{4}\.[a-f0-9]{4}', line)
-            if not remac:
-                log(cmtslog, "Could not retrieve MAC from: %s" % line, 'WARNING')
-                continue
+        mac = remac[0]
+        ip6 = None
+        chn = "unknown"
+        prf = "unknown"
 
-            # STATUS
-            src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+[0-9]+x[0-9]\s+([a-zA-Z\-]+)\s+[0-9]\.[0-9]', line)    # line 1, 2, 3  (Operational, Online-d)
-            if not src:
-                src = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+[0-9]+\s+([a-zA-Z]+)\s+[0-9]\.[0-9]', line)                 # line 4        (Offline)
+        if reip6: ip6 = reip6[0]
+        if rechn: chn = rechn[0]
+        if reprf: prf = reprf[0]
 
-            try:
-                status = src.group(1)
-            except AttributeError:
-                status = "unknown"
+        if not mac in finaldict: # is this really necessary?
+            finaldict[mac] = {}
 
-            # FNODE
-            n = re.search('\d+/\d+/\d+\-\d+/\d+/\d+\s+([0-9]+)\s+', line)
+        finaldict[mac]["status"] = status
+        finaldict[mac]["node"] = node
+        finaldict[mac]["chans"] = chn
+        finaldict[mac]["speed"] = prf
 
-            try:
-                node = n.group(1)
-            except AttributeError:
-                node = "unknown" # should not happen
+        # get current IP (if any)
+        ips = []
+        if not mac in pickledict:
+            pickledict[mac] = {}
 
-            # CHANNELS, PROFILE
-            rechn = re.findall('[0-9]+x[0-9]+', line)
-            reprf = re.findall('[0-9]+[K,M]/[0-9]+[K,M]?', line)
+        if "ip" in pickledict[mac]:
+            ips.extend(pickledict[mac]["ip"])
 
-            mac = remac[0]
-            ip6 = None
-            chn = "unknown"
-            prf = "unknown"
+        # action this only:
+        # 1. when current IP available
+        # 2. current IP differs from last recorded one
 
-            if reip6: ip6 = reip6[0]
-            if rechn: chn = rechn[0]
-            if reprf: prf = reprf[0]
+        if ip6:
+            ip6 = ip6.rstrip() # strip \r\n
 
-            if not mac in finaldict: # is this really necessary?
-                finaldict[mac] = {}
+            if ips:
+                if ip6 != ips[0]: # current vs last
+                    # keep IP pool size
+                    if len(ips) == CMTSCACHEIPPOOL:
+                        ips = ips[:-1]
 
-            finaldict[mac]["status"] = status
-            finaldict[mac]["node"] = node
-            finaldict[mac]["chans"] = chn
-            finaldict[mac]["speed"] = prf
+                    ips = unshift(ips, ip6)
+            else:
+                ips.append(ip6)
 
-            # get current IP (if any)
-            ips = []
-            if not mac in pickledict:
-                pickledict[mac] = {}
+        # assign result
+        finaldict[mac]["ip"] = ips
+        pickledict[mac]["ip"] = ips
 
-            if "ip" in pickledict[mac]:
-                ips.extend(pickledict[mac]["ip"])
 
-            # action this only:
-            # 1. when current IP available
-            # 2. current IP differs from last recorded one
+    ##
+    ## 2. collect FW version
 
-            if ip6:
-                ip6 = ip6.rstrip() # strip \r\n
+    for line in ssh.cmdCmts('show cable modem system-description', 120):
+        #5/7/0-3/7/8       fde5:c758:f711:2f:1c74:53c2:21a1:7b40   7823.aeab.ca75 Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnD31CM-FALCON-1.0.0.1-GA-10-NOSH; MODEL: CM8200B>>
+        #5/7/0-3/7/6                                               909d.7d80.b6f9 Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnCM8200.0200.174F.311438.NSH.NB.EU; MODEL: CM8200B>>
+        #5/7/0-3/7/11      fde5:c758:f711:2f:f12f:122e:5a81:f1f    909d.7d80.b7dd Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnCM8200.0200.174F.311438.NSH.NB.EU; MODEL: CM8200B>>
+        #5/7/8-3/7/10      fde5:c758:f711:2f:ed0b:b54f:4fdd:86f4   90c7.92fa.3d41 ARRIS EuroDOCSIS 3.0 Touchstone WideBand Cable Modem <<HW_REV: 1; VENDOR: Arris Interactive, L.L.C.; BOOTR: 1.2.1.62; SW_REV: nbn9.1.103P7; MODEL: CM820B/AU>>
+        #5/2/6-3/5/2                                               0007.1117.fea8 Viavi Solutions ONX DOCSIS 3.1 <<HW_REV: V1.0 US; VENDOR: Viavi Solutions; BOOTR: V1.0; SW_REV: V1.0; MODEL: onxdocsis31>>
+        if not re.match('\d+/\d+/\d+\-\d+/\d+/\d+', line):
+            continue
 
-                if ips:
-                    if ip6 != ips[0]: # current vs last
-                        # keep IP pool size
-                        if len(ips) == CMTSCACHEIPPOOL:
-                            ips = ips[:-1]
+        # this will (should) yield single output
+        refwmac = re.findall('[a-f0-9]{4}\.[a-f0-9]{4}\.[a-f0-9]{4}', line)
+        refwver = re.findall('<<.*>>', line)
 
-                        ips = unshift(ips, ip6)
-                else:
-                    ips.append(ip6)
+        if not refwmac:
+            Cmtslog.warn("Could not retrieve FW MAC from: %s" % line)
+            continue
+        if not refwver:
+            Cmtslog.warn("Could not retrieve FW ver from: %s" % line)
+            continue
 
-            # assign result
-            finaldict[mac]["ip"] = ips
-            pickledict[mac]["ip"] = ips
+        m = refwmac[0]
+        f = refwver[0]
 
-        #pprint(finaldict)
+        # this should always succeed
+        try:
+            finaldict[m]["fw"] = f
+        except KeyError:
+            Cmtslog.warn("Could not find MAC %s in finaldictionary[...]" % m)
+            continue
 
-        ##
-        ## 2. collect FW version
-
-        child.sendline("show cable modem system-description")
-        child.expect(cmtsprompt)
-
-        fwresult = child.before
-        #pprint(fwresult)
-
-        for line in fwresult.split('\r\n'):
-            #10/2/8-2/1/12     fde5:c758:f711:6512:a991:eef9:bdd7:edf2 b093.5baa.a13d Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnD31CM-FALCON-1.0.0.1-GA-10-NOSH; MODEL: CM8200B>>
-            if not re.match('\d+/\d+/\d+\-\d+/\d+/\d+', line):
-                continue
-
-            # this will (should) yield single output
-            refwmac = re.findall('[a-f0-9]{4}\.[a-f0-9]{4}\.[a-f0-9]{4}', line)
-            refwver = re.findall('<<.*>>', line)
-
-            if not refwmac:
-                log(cmtslog, "Could not retrieve FW MAC from: %s" % line, 'WARNING')
-                continue
-            if not refwver:
-                log(cmtslog, "Could not retrieve FW ver from: %s" % line, 'WARNING')
-                continue
-
-            m = refwmac[0]
-            f = refwver[0]
-
-            # this should always succeed
-            try:
-                finaldict[m]["fw"] = f
-            except KeyError:
-                continue
-
-    except Exception, e:
-        log(cmtslog, "CMTS %s failed processing with: %s" % (cmts, str(e)), 'CRITICAL')
+    ssh.close()
 
     #pprint(pickledict)
     #pprint(finaldict)
-    #sys.exit(0)
 
     # dump result to files
-    log(cmtslog, "Dumping collection result to file (pickle): %s" % cmtscachefile)
+    Cmtslog.info("Dumping collection result to file (pickle): %s" % cmtscachefile)
     with open(cmtscachefile, "wb") as fh:
         pickle.dump(pickledict, fh)
 
     # At times the T3 webservice cannot parse the JSON file (JSON invalid - missing end of file) which is due
     # to race condition here. Try to avoid it by dumping into a .tmp file and then renaming.
-    log(cmtslog, "Dumping collection result to file (json): %s" % cmtscachefilejsontmp)
+    Cmtslog.info("Dumping collection result to file (json): %s" % cmtscachefilejsontmp)
     with open(cmtscachefilejsontmp, "w") as fh:
         json.dump(finaldict, fh)
 
-    log(cmtslog, "Renaming '%s' to '%s' to finalize collection" % (cmtscachefilejsontmp, cmtscachefilejson))
+    Cmtslog.info("Renaming '%s' to '%s' to finalize collection" % (cmtscachefilejsontmp, cmtscachefilejson))
     os.rename(cmtscachefilejsontmp, cmtscachefilejson)
 
-    cmtslog.close()
+    Cmtslog.close()
     sys.exit(0)
 
-def cmts_collection(allcmts):
-    # Retrieve creds here to allow for creds change mid-flight.
-    # (not to lose the full run)
-    uname, passw = utils.get_creds()
-    if not uname or not passw:
-        log(LOG, "Failed retrieving uname/passw", 'CRITICAL')
-        sys.exit(1)
+def get_creds():
+    cfile = '/bin/creds';
+    uname = ""
+    passw = ""
+
+    if not os.path.isfile(cfile) or not os.access(cfile, os.X_OK):
+        Log.crit("Cannot execute creds file: %s" % cfile)
+        print "Cannot execute creds file: %s" % cfile
+        sys.exit(5)
+
+    res = Utils.shellCmd(cfile)
+    creds = res[1][0].split()
+    splitat = re.sub('^0*', '', creds[0])
 
     count = 0
-    for cmts in allcmts:
+    for o in creds[1:]:
+        c = chr(int(o, 8))
+
+        if count < int(splitat):
+            uname = "%s%s" % (uname, c)
+        else:
+            passw = "%s%s" % (passw, c)
+
+        count += 1
+
+    return uname, passw
+
+def cmts_collection(cmtsbatch):
+    # Retrieve creds here to allow for creds change mid-flight.
+    # (not to lose the full run, only a single batch)
+    uname, passw = get_creds()
+
+    if not uname or not passw:
+        Log.crit("Failed retrieving uname/passw")
+        sys.exit(1)
+
+    for cmts in cmtsbatch:
         try:
             pid = os.fork()
         except OSError:
-            log(LOG, "Could not fork() %s" % cmts, "CRITICAL")
+            Log.crit("Could not fork() %s" % cmts)
             continue
 
         # child
         if pid == 0:
             run_child(cmts, uname, passw)
 
-        log(LOG, "Fork() CMTS %s, PID %d" % (cmts, pid))
-        count += 1
+        Log.info("Fork() CMTS %s, PID %d" % (cmts, pid))
 
-    for count in range(len(allcmts)):
+    for _ in range(len(cmtsbatch)):
         finished = os.waitpid(0, 0)
-        log(LOG, "Reaped child PID %d, exit status %d" % finished)
+        msg = "Reaped child PID %d, exit status %d" % finished
+        Log.info(msg) if finished[1] == 0 else Log.warn(msg)
 
     return 1
 
 def main(params):
-    allcmts = utils.get_cmts_list().keys()
-    #allcmts = ['SWCMT0000221']
-    #allcmts = ['SWCMT0000019']
-    #allcmts = [ 'SWCMT0000164']
-    #allcmts = [ 'SWCMT0000279' ]
+    try:
+        opts, args = getopt.getopt(params[1:], "hdt:v", ["help","debug","topo="])
+    except getopt.GetoptError as e:
+        print str(e)
+        usage(params[0])
+        sys.exit(127)
 
-    # we assume we have ~300 CMTS in total
-    # split them by CMTS_BATCH_SIZE
+    topofile = None
+    debug = False
+    for opt, val in opts:
+        if opt in ("-h", "--help"):
+            usage(params[0])
+            sys.exit(0)
 
-    start = 0
-    end = 0
-    while True:
-        end += CMTS_BATCH_SIZE
-        start = end - CMTS_BATCH_SIZE 
+        if opt in ("-d", "--debug"):
+            debug = True
+            continue
 
-        try:
-            if allcmts[end]:
-                cmts_collection(allcmts[start:end])
-        except IndexError:
-            cmts_collection(allcmts[start:])
-            break
+        if opt in ("-t", "--topo"):
+            topofile = val
 
-        # since we wait and collect our children in cmts_collection
-        # this is 1 sec wait since the finish of last child in batch
-        time.sleep(1)
+    if not topofile:
+        Log.crit("No topology file supplied")
+        usage(params[0])
+        sys.exit(127)
+
+    t = Topology(topofile, debug)
+
+    allcmts = t.getCmts()
+    #allcmts = ['SWCMT0000282', 'SWCMT0000283']
+
+    # We expect ~300 CMTS in total.
+    # Limit max number of CMTS batches to 10 per itiration.
+    # Log if batch size goes over 30 CMTS as things may need to be re-thought.
+    if len(allcmts) > 300:
+        Log.warn("Hitting limit of 300+ CMTS - this may cause some problems and will need attention!")
+
+    ITIRATION_LIMIT = 10
+
+    cmts_batch_size = int(len(allcmts) / ITIRATION_LIMIT)
+    cmts_batch_mod = len(allcmts) % ITIRATION_LIMIT
+
+    if cmts_batch_mod > 0:
+        cmts_batch_size = cmts_batch_size + 1
+
+    batch = []
+    for i in range(0, len(allcmts)):
+        if (i % cmts_batch_size) == 0 and i != 0:
+            Log.info(">>> Running CMTS batch with %d CMTS (%s)" % (len(batch), batch))
+            cmts_collection(batch)
+            batch = []
+
+        batch.append(allcmts[i])
+
+    if len(batch):
+        cmts_collection(batch)
 
     return 1
+
+def usage(self):
+    usage = """
+Usage: {0} <option> <value> [<option> ...]
+Options:
+ Must
+    -t|--topo <file>    topology file
+ May
+    -d|--debug          debug on
+    -h|--help           show this helpful message
+""".format(self)
+
+    print usage
 
 ## TODO this needs fixing!!!
 def ctrlc_handler(signum, frame):
