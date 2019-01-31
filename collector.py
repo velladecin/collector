@@ -27,7 +27,7 @@ def unshift(arr, val):
     val.extend(arr)
     return val
 
-def run_child(cmts, uname, passw):
+def run_child(cmts):
     pid = os.getpid()
     basedir = BASEDIR
     if not basedir: basedir = '.'
@@ -55,8 +55,11 @@ def run_child(cmts, uname, passw):
         with open(cmtscachefile, "rb") as fh:
             pickledict = pickle.loads(fh.read())
 
+    # each child gets their own creds
+    # so in theory (when creds change) the next bach will succeed
+
     ssh = Ssh()
-    if not ssh.loginCmts_NoHostCheck(cmts, uname, passw):
+    if not ssh.loginCmts_NoHostCheck(cmts):
         Cmtslog.crit("Could not log in to CMTS %s" % cmts)
         sys.exit(1)
 
@@ -206,42 +209,7 @@ def run_child(cmts, uname, passw):
     Cmtslog.close()
     sys.exit(0)
 
-def get_creds():
-    cfile = '/bin/creds';
-    uname = ""
-    passw = ""
-
-    if not os.path.isfile(cfile) or not os.access(cfile, os.X_OK):
-        Log.crit("Cannot execute creds file: %s" % cfile)
-        print "Cannot execute creds file: %s" % cfile
-        sys.exit(5)
-
-    res = Utils.shellCmd(cfile)
-    creds = res[1][0].split()
-    splitat = re.sub('^0*', '', creds[0])
-
-    count = 0
-    for o in creds[1:]:
-        c = chr(int(o, 8))
-
-        if count < int(splitat):
-            uname = "%s%s" % (uname, c)
-        else:
-            passw = "%s%s" % (passw, c)
-
-        count += 1
-
-    return uname, passw
-
 def cmts_collection(cmtsbatch):
-    # Retrieve creds here to allow for creds change mid-flight.
-    # (not to lose the full run, only a single batch)
-    uname, passw = get_creds()
-
-    if not uname or not passw:
-        Log.crit("Failed retrieving uname/passw")
-        sys.exit(1)
-
     for cmts in cmtsbatch:
         try:
             pid = os.fork()
@@ -251,7 +219,7 @@ def cmts_collection(cmtsbatch):
 
         # child
         if pid == 0:
-            run_child(cmts, uname, passw)
+            run_child(cmts)
 
         Log.info("Fork() CMTS %s, PID %d" % (cmts, pid))
 
@@ -318,6 +286,7 @@ def main(params):
         batch.append(allcmts[i])
 
     if len(batch):
+        Log.info(">>> Running last CMTS batch with %d CMTS (%s)" % (len(batch), batch))
         cmts_collection(batch)
 
     return 1
