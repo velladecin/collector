@@ -10,7 +10,7 @@ from datetime import datetime
 import t3_PyLib.Logger
 from t3_PyLib import Utils
 from t3_PyLib.Topology import Topology
-from t3_PyLib.Ssh import Ssh
+from t3_PyLib.Cmts import *
 
 CMTSCACHEDIR  = 'cmtscache'
 CMTSCACHEIPPOOL = 10
@@ -27,7 +27,7 @@ def unshift(arr, val):
     val.extend(arr)
     return val
 
-def run_child(cmts):
+def run_child(cmts, creds):
     pid = os.getpid()
     basedir = BASEDIR
     if not basedir: basedir = '.'
@@ -58,10 +58,11 @@ def run_child(cmts):
     # each child gets their own creds
     # so in theory (when creds change) the next bach will succeed
 
-    ssh = Ssh()
-    if not ssh.loginCmts_NoHostCheck(cmts):
+    try:
+        swcmt = Cmts(cmts, creds)
+    except (CmtsBadName, CmtsLoginFail) as e:
         Cmtslog.crit("Could not log in to CMTS %s" % cmts)
-        sys.exit(1)
+        os._exit(0)
 
     ##
     ## 1. collect CM details
@@ -70,7 +71,7 @@ def run_child(cmts):
     # Discard anything that has disappeared. This will lose some historical data for eg ppl who are on holidays,
     # but currently it seems to be the best option. (do I hear.. doh?)
 
-    for line in ssh.cmdCmts('show cable modem', 120):
+    for line in swcmt.executeCmd("show cable modem", 180):
         # 1) 5/7/0-3/7/10      48     8x4   Operational 3.0    12M/1240     0  bcca.b5ff.69b5  fde5:c758:f711:2f:fc63:55cf:fa7d:9992
         # 2) 10/2/8-2/1/12     19     16x4  Operational 3.1    25M/5215     0  7823.aea8.376d  fde5:c758:f711:6512:7d0c:5025:efaf:494f
         # 3) 11/2/14-1/7/12    11     16x4  Online-d    3.1                 0  203d.66ae.f34d  fd29:b4b0:cf0c:c10a:9142:e3c:3170:3f62
@@ -157,7 +158,7 @@ def run_child(cmts):
     ##
     ## 2. collect FW version
 
-    for line in ssh.cmdCmts('show cable modem system-description', 120):
+    for line in swcmt.executeCmd("show cable modem system-description", 180):
         #5/7/0-3/7/8       fde5:c758:f711:2f:1c74:53c2:21a1:7b40   7823.aeab.ca75 Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnD31CM-FALCON-1.0.0.1-GA-10-NOSH; MODEL: CM8200B>>
         #5/7/0-3/7/6                                               909d.7d80.b6f9 Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnCM8200.0200.174F.311438.NSH.NB.EU; MODEL: CM8200B>>
         #5/7/0-3/7/11      fde5:c758:f711:2f:f12f:122e:5a81:f1f    909d.7d80.b7dd Scan-A <<HW_REV: 4; VENDOR: ARRIS Group, Inc.; BOOTR: 2700; SW_REV: nbnCM8200.0200.174F.311438.NSH.NB.EU; MODEL: CM8200B>>
@@ -180,14 +181,17 @@ def run_child(cmts):
         m = refwmac[0]
         f = refwver[0]
 
-        # this should always succeed
         try:
-            finaldict[m]["fw"] = f
+            finaldict[m]["fw"] = unicode(f, errors="strict")
         except KeyError:
             Cmtslog.warn("Could not find MAC %s in finaldictionary[...]" % m)
-            continue
+        except UnicodeDecodeError:
+            Cmtslog.warn("Could not decode FW '%s' for %s" % (f, m))
 
-    ssh.close()
+            if m in finaldict:
+                finaldict[m]["fw"] = "<<COULD_NOT_DECODE>>"
+
+    swcmt.close()
 
     #pprint(pickledict)
     #pprint(finaldict)
@@ -207,23 +211,27 @@ def run_child(cmts):
     os.rename(cmtscachefilejsontmp, cmtscachefilejson)
 
     Cmtslog.close()
-    sys.exit(0)
+    os._exit(0)
 
 def cmts_collection(cmtsbatch):
+    creds = FileCreds()
+
+    forked = 0
     for cmts in cmtsbatch:
         try:
             pid = os.fork()
+            forked = forked + 1
         except OSError:
             Log.crit("Could not fork() %s" % cmts)
             continue
 
         # child
         if pid == 0:
-            run_child(cmts)
+            run_child(cmts, creds)
+        else:
+            Log.info("Fork() CMTS %s, PID %d" % (cmts, pid))
 
-        Log.info("Fork() CMTS %s, PID %d" % (cmts, pid))
-
-    for _ in range(len(cmtsbatch)):
+    for _ in range(forked):
         finished = os.waitpid(0, 0)
         msg = "Reaped child PID %d, exit status %d" % finished
         Log.info(msg) if finished[1] == 0 else Log.warn(msg)
@@ -304,7 +312,6 @@ Options:
 
     print usage
 
-## TODO this needs fixing!!!
 def ctrlc_handler(signum, frame):
     print "\nCaught CTRL+C, leaving at user's request.."
     time.sleep(.5)
