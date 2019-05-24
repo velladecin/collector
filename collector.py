@@ -1,7 +1,6 @@
 #!/usr/bin/python
 import getopt
 import sys, os.path
-import logging
 import re
 # T3
 from t3_PyLib.Collector import Collector
