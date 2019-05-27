@@ -144,9 +144,10 @@ class Collector:
 
         self._cmtsinfo("Running child: %s, pid %d" % (cmts, pid))
 
-        cmtscachefile        = "%s/%s"   % (self.cachedir, cmts)
-        cmtscachefilejson    = "%s.json" % cmtscachefile
-        cmtscachefilejsontmp = "%s.tmp"  % cmtscachefilejson
+        cmtscachefile     = "%s/%s"             % (self.cachedir, cmts)
+        cmtscachefilejson = "%s.json"           % cmtscachefile
+        ipv6gwcachefile   = "%s/%s.ipv6gw.json" % (self.cachedir, cmts)
+        fncachefile       = "%s/%s.fn.json"     % (self.cachedir, cmts)
 
         # We use both pickle & JSON - read-in cache with pickle and dump both pickle and JSON.
         # Cache is really only used for tracking IPs history per CM.
@@ -193,21 +194,42 @@ class Collector:
         with open(cmtscachefile, "wb") as fh:
             pickle.dump(self.pickledict, fh)
 
-        # At times the t3.service cannot parse the JSON file (JSON invalid - missing end of file) which is due
-        # to race condition here. Try to avoid it by dumping into a .tmp file and then renaming.
-        self._cmtsinfo("Dumping collection result to file (json): %s" % cmtscachefilejsontmp)
-        with open(cmtscachefilejsontmp, "w") as fh:
-            json.dump(self.scm, fh)
+        for combo in (["scm", cmtscachefilejson], ["ipv6gw", ipv6gwcachefile], ["fn", fncachefile]):
+            type, filename = combo
 
-        self._cmtsinfo("Renaming '%s' to '%s' to finalize collection" % (cmtscachefilejsontmp, cmtscachefilejson))
-        os.rename(cmtscachefilejsontmp, cmtscachefilejson)
+            try:
+                self.__dumpToJson(type, filename)
+            except (ValueError, AttributeError) as e:
+                # ValueError is raised by me
+                # AttributeError could be raised by missing self.{scm,ipv6gw,fn,..}
+                self._cmtscrit("JSON file dump failed with: %s" % str(e))
 
         os._exit(0)
+
+    def __dumpToJson(self, type, filename):
+        if type == "scm":
+            dict = self.scm
+        elif type == "ipv6gw":
+            dict = self.ipv6gw
+        elif type == "fn":
+            dict = self.fn
+        else:
+            raise ValueError("Unknown type name: '%s'" % type)
+
+        # At times the t3.service cannot parse the JSON file (JSON invalid - missing end of file) which is due to race condition here.
+        # Try to mitigate it as much as possible by dumping into a .tmp file and then renaming.
+
+        filenametmp = "%s.tmp" % filename
+        with open(filenametmp, "w") as fh:
+            json.dump(dict, fh)
+
+        self._cmtsinfo("Renaming '%s' to '%s' to finalize collection" % (filenametmp, filename))
+        os.rename(filenametmp, filename)
 
     def __initCmts(self, cmts):
         try:
             swcmt = Cmts(cmts, 0, self.creds)
-        except (CmtsBadName, CmtsLoginFail) as e:
+        except (CmtsBadName, CmtsLoginFail):
             swcmt = None
 
         return swcmt
