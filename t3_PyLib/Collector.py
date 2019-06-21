@@ -8,6 +8,7 @@ from pprint import pprint
 # T3
 from t3_PyLib.Topology import Topology
 from t3_PyLib.Cmts import *
+from t3_PyLib.Ssh import *
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ class Collector:
             pass
 
         self.cmts = topo.getCmts()
-        #self.cmts = [ 'SWCMT0000306' ]
+        #self.cmts = [ 'SWCMT0000320' ]
 
         return self
 
@@ -184,7 +185,7 @@ class Collector:
         #pprint(self.pickledict)
 
         # close SSH connection
-        swcmt.close()
+        swcmt.closeSsh()
 
         # dump result to files
         # 1. pickle
