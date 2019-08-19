@@ -184,8 +184,8 @@ class Collector:
         #pprint(self.scm)
         #pprint(self.pickledict)
 
-        # close SSH connection
-        swcmt.closeSsh()
+        # close connection
+        swcmt.disconnect()
 
         # dump result to files
         # 1. pickle
