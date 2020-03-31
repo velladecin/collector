@@ -63,7 +63,7 @@ class Collector:
             pass
 
         self.cmts = topo.getCmts()
-        #self.cmts = [ 'SWCMT0000320' ]
+        #self.cmts = [ 'SWCMT0000120' ]
 
         return self
 
@@ -149,6 +149,8 @@ class Collector:
         cmtscachefilejson = "%s.json"           % cmtscachefile
         ipv6gwcachefile   = "%s/%s.ipv6gw.json" % (self.cachedir, cmts)
         fncachefile       = "%s/%s.fn.json"     % (self.cachedir, cmts)
+        ofdmacachefile    = "%s/%s.ofdma.json"  % (self.cachedir, cmts)
+        ofdmcachefile     = "%s/%s.ofdm.json"   % (self.cachedir, cmts)
 
         # We use both pickle & JSON - read-in cache with pickle and dump both pickle and JSON.
         # Cache is really only used for tracking IPs history per CM.
@@ -161,9 +163,13 @@ class Collector:
                 self.pickledict = pickle.loads(f.read())
         except IOError: 
             pass
+        except ValueError:
+            print("Could not load pickle file for %s" % cmts)
+            self._cmtscrit("Could not load pickle file for %s" % cmts)
 
         swcmt = self.__initCmts(cmts)
         if not swcmt:
+            #print ">>>>>>>>>> No login to CMTS: %s" % cmts
             self._cmtscrit("Could not login to CMTS: %s" % cmts)
             os._exit(0)
 
@@ -175,6 +181,9 @@ class Collector:
         # will select from these when scm is running
         self.__ipv6routingelements(swcmt)
         self.__scfn(swcmt)
+        # OFDM/A
+        self.__ofdma(swcmt)
+        self.__ofdm(swcmt)
 
         # scm is the base
         self.__scm(swcmt)
@@ -195,7 +204,7 @@ class Collector:
         with open(cmtscachefile, "wb") as fh:
             pickle.dump(self.pickledict, fh)
 
-        for combo in (["scm", cmtscachefilejson], ["ipv6gw", ipv6gwcachefile], ["fn", fncachefile]):
+        for combo in (["scm", cmtscachefilejson], ["ipv6gw", ipv6gwcachefile], ["fn", fncachefile], ["ofdm", ofdmcachefile], ["ofdma", ofdmacachefile]):
             type, filename = combo
 
             try:
@@ -208,14 +217,12 @@ class Collector:
         os._exit(0)
 
     def __dumpToJson(self, type, filename):
-        if type == "scm":
-            dict = self.scm
-        elif type == "ipv6gw":
-            dict = self.ipv6gw
-        elif type == "fn":
-            dict = self.fn
-        else:
-            raise ValueError("Unknown type name: '%s'" % type)
+        if type == "scm":       dict = self.scm
+        elif type == "ipv6gw":  dict = self.ipv6gw
+        elif type == "fn":      dict = self.fn
+        elif type == "ofdma":   dict = self.ofdma
+        elif type == "ofdm":    dict = self.ofdm
+        else:                   raise ValueError("Unknown type name: '%s'" % type)
 
         # At times the t3.service cannot parse the JSON file (JSON invalid - missing end of file) which is due to race condition here.
         # Try to mitigate it as much as possible by dumping into a .tmp file and then renaming.
@@ -238,6 +245,64 @@ class Collector:
 
     #
     # Actual collecting
+
+    def __ofdm(self, swcmt):
+        self.ofdm = {}
+
+        for line in swcmt.executeCmd("show interface cable-downstream ds-type ofdm"):
+            #OFDM Channels:
+            #DS         Cable Chan Prim  Oper   Freq Low-High   PLC Band   LicBW    Num of  Subcarrier    Rolloff Cyclic  Intrlv
+            #S/C/CH     Mac   ID   Cap   State   (MHz.KHz)        (MHz)    (MHz)     Prof   Spacing(KHz)  Period  Prefix  Depth(time)
+            #5/0/32       41   33  False   IS  762.000-858.000     763      94        4          50         256    512     4
+            #5/1/32       42   33  False   IS  762.000-858.000     763      94        4          50         256    512     4
+            #12/7/32       8   33  False   IS  762.000-858.000     763      94        4          50         256    512     4
+
+            if not re.match('\d+/\d+/\d+', line):
+                continue
+
+            dets = re.findall('\d+/\d+/\d+\s+(\d+)\s+\d+\s+[A-Za-z]+\s+[A-Z]+\s+([0-9\.\-]+)\s+', line)
+
+            try:
+                cablemac, freq = dets[0]
+            except ValueError:
+                self._cmtswarn("OFDM - could not retrive cable-mac and/or frequency from: %s" % line)
+            else:
+                swcmtname = swcmt.getName()
+
+                try:
+                    self.ofdm[swcmtname]
+                except KeyError:
+                    self.ofdm[swcmtname] = {}
+
+                self.ofdm[swcmtname][cablemac] = freq
+
+    def __ofdma(self, swcmt):
+        self.ofdma = {}
+
+        for line in swcmt.executeCmd("show interface cable-upstream us-type ofdma"):
+            #OFDMA Channels:
+            #US          Cable     Oper    Freq Low-High    LicBW   Minislots  Mod  Subcarrier   Rolloff Cyclic Sym/  Rx Power(dBmV)
+            #S/CG/CH     Mac  Conn State    (MHz.KHz)      (100KHz) per frame  Prof Spacing(KHz) Period  Prefix Frame (6.4MHz Norm)
+            #1/5/25        8    11    IS  14.600-25.800     112        28        1       50         96    192      16         0
+
+            if not re.match('\d+/\d+/\d+', line):
+                continue
+
+            dets = re.findall('\d+/\d+/\d+\s+(\d+)\s+\d+\s+[A-Za-z]+\s+([0-9\.\-]+)\s+', line)
+
+            try:
+                cablemac, freq = dets[0]
+            except ValueError:
+                self._cmtswarn("OFDM-A - could not retrive cable-mac and/or frequency from: %s" % line)
+            else:
+                swcmtname = swcmt.getName()
+
+                try:
+                    self.ofdma[swcmtname]
+                except KeyError:
+                    self.ofdma[swcmtname] = {}
+
+                self.ofdma[swcmtname][cablemac] = freq
 
     def __sysdescr(self, swcmt):
         self.sysdescr = {}
@@ -327,9 +392,12 @@ class Collector:
             reprf = re.findall('[0-9]+[K,M]/[0-9]+[K,M]?', line)
 
             mac = remac[0]
-            #ip6 = None
+            # For whatever reason "ip6" stays defined with previous mac's IP (python bug?? and possibly the other values too..)
+            # and so we need to make sure to declare it for the logic further below.. :/
+            ip6 = "unknown"
             chn = "unknown"
             prf = "unknown"
+
 
             if reip6: ip6 = reip6[0]
             if rechn: chn = rechn[0]
@@ -342,10 +410,7 @@ class Collector:
             self.scm[mac]["node"] = node
             self.scm[mac]["chans"] = chn
             self.scm[mac]["speed"] = prf
-            try:
-                self.scm[mac]["ip"] = [ip6]
-            except NameError:
-                self.scm[mac]["ip"] = []
+            self.scm[mac]["ip"] = [ip6]
 
             # Merge IPs from disk/pickle cache + current IP, pickle dict exists from __runChild()
 
